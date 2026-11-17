@@ -2302,3 +2302,55 @@ fn a_linked_text_box_shows_and_follows_its_link_from_inside() {
     let (start, _) = wordcraft_engine::cmd::insert::bookmark_range(&s.doc, "Spot").unwrap();
     assert!(s.sel.is_collapsed() && s.sel.focus == start, "the caret went to the bookmark: {:?}", s.sel);
 }
+
+/// #5602: clicking a picture that is partly off the window's edge, or taller than a small
+/// window, selects it without scrolling the view (the selection used to be followed like a
+/// caret).
+#[test]
+fn clicking_a_picture_in_a_small_window_does_not_scroll_the_view() {
+    for width in [160, 700] {
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+        for i in 0..70 {
+            a.run("text.insert", json!({"text": format!("Line {i} of the body text")})).unwrap();
+            a.run("text.newParagraph", json!({})).unwrap();
+        }
+        a.run("view.commentsPane", json!({"value": false})).unwrap();
+        a.run("caret.docStart", json!({})).unwrap();
+        let img = image::RgbaImage::from_pixel(40, 20, image::Rgba([200, 30, 30, 255]));
+        let png = wordcraft_geom::picture::encode_format(&image::DynamicImage::ImageRgba8(img).clone(), image::ImageFormat::Png).unwrap();
+        a.run("insert.picture", json!({"data": wordcraft_engine::cmd::insert::base64_encode(&png), "width": width})).unwrap();
+        let pos = wordcraft_engine::cmd::objects::selected(&a.session).unwrap().0;
+        a.session.sel = wordcraft_engine::Selection::caret(Pos::body(3, 0));
+        let mut h = crate::test_harness::builder().with_size(egui::vec2(900.0, 420.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        steps(&mut h, 6);
+        let rect = h.state_mut().session.layout().object(&pos, 0).expect("the picture is laid out").rect;
+        let corner = |h: &mut H, x: f32, y: f32| page_to_screen(h.state_mut(), 0, x, y).expect("the picture is on screen");
+        let view = h.state().canvas.view_rect().expect("the canvas has been shown");
+        // Scroll until the picture's top edge is above the window's: part of it is out of view.
+        let top = corner(&mut h, rect.x, rect.y).y;
+        h.state_mut().canvas.view.offset.1 += f64::from(top - view.top()) + 40.0;
+        steps(&mut h, 6);
+        let before = h.state().canvas.view.offset;
+        let (min, max) = (corner(&mut h, rect.x, rect.y), corner(&mut h, rect.x + rect.w, rect.y + rect.h));
+        let shown = egui::Rect::from_min_max(min, max);
+        assert!(shown.top() < view.top(), "{width}: the picture starts above the window: {shown:?} {view:?}");
+        let at = pos2(shown.center().x, shown.center().y.clamp(view.top() + 10.0, view.bottom() - 10.0));
+        assert!(shown.contains(at), "{width}: the click lands on the picture {shown:?} {view:?}");
+        h.event(egui::Event::PointerMoved(at));
+        h.app_frame();
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+            h.app_frame();
+        }
+        steps(&mut h, 10);
+        assert_eq!(wordcraft_engine::cmd::objects::selected(&h.state().session).map(|o| o.0), Some(pos), "{width}: the picture is selected");
+        assert_eq!(h.state().canvas.view.offset, before, "{width}: the view stayed where it was");
+    }
+}
